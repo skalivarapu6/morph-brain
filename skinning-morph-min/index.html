@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>three.js – skinning + morph (minimal)</title>
+
+    <!-- Import map so addons can do: import {...} from 'three' / 'three/addons/*' -->
+    <script type="importmap">
+    {
+      "imports": {
+        "three": "./three.module.js",
+        "three/addons/": "./jsm/"
+      }
+    }
+    </script>
+  </head>
+  <body style="margin:0; overflow:hidden">
+    <canvas id="c"></canvas>
+
+    <script type="module">
+      import * as THREE from 'three';
+      import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+      import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+      import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
+
+      const canvas = document.getElementById('c');
+      const renderer = new THREE.WebGLRenderer({ canvas, antialias:true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x222222);
+
+      const camera = new THREE.PerspectiveCamera(45, innerWidth/innerHeight, 0.25, 100);
+      camera.position.set( -5, 3, 10 );
+
+      const controls = new OrbitControls(camera, renderer.domElement);
+      controls.target.set(0, 1, 0); controls.update();
+
+      // lights
+      scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.0));
+      const dir = new THREE.DirectionalLight(0xffffff, 1.2);
+      dir.position.set(3, 10, 10); scene.add(dir);
+
+      // load RobotExpressive glb (has states, emotes, and morph targets)
+      const loader = new GLTFLoader();
+      let mixer, actions = {}, activeAction;
+
+      loader.load('./RobotExpressive.glb', (gltf) => {
+        const model = gltf.scene;
+        model.position.set(0, 0, 0);
+        scene.add(model);
+
+        mixer = new THREE.AnimationMixer(model);
+        for (const clip of gltf.animations) actions[clip.name] = mixer.clipAction(clip);
+
+        // default looping state
+        activeAction = actions['Idle'] || actions[Object.keys(actions)[0]];
+        activeAction?.play();
+
+        // simple GUI: switch base states & play emotes; tweak 3 morphs
+        const states = ['Idle','Walking','Running','Dance','Death','Sitting','Standing'];
+        const emotes = ['Jump','Yes','No','Wave','Punch','ThumbsUp'];
+
+        const gui = new GUI();
+        const api = { state: 'Idle', emote: () => playOneShot('Wave'), Angry: 0, Surprised: 0, Sad: 0 };
+
+        gui.add(api, 'state', states).name('State').onChange(name => crossfadeTo(name, 0.35));
+        for (const e of emotes) gui.add({[e]:()=>playOneShot(e)}, e);
+        const morphFolder = gui.addFolder('Expressions');
+        morphFolder.add(api, 'Angry', 0, 1).onChange(v => setExpression('Angry', v));
+        morphFolder.add(api, 'Surprised', 0, 1).onChange(v => setExpression('Surprised', v));
+        morphFolder.add(api, 'Sad', 0, 1).onChange(v => setExpression('Sad', v));
+
+        function crossfadeTo(name, t) {
+          const next = actions[name]; if (!next || activeAction === next) return;
+          next.reset().setEffectiveWeight(1).setEffectiveTimeScale(1).play();
+          activeAction?.crossFadeTo(next, t, true);
+          activeAction = next;
+        }
+        function playOneShot(name) {
+          const a = actions[name]; if (!a) return;
+          a.reset().setLoop(THREE.LoopOnce, 1); a.clampWhenFinished = true; a.fadeIn(0.2).play();
+          setTimeout(()=>a.fadeOut(0.2), 1000 * (a.getClip?.().duration || 1.5));
+        }
+        function setExpression(key, val) {
+          model.traverse(obj => {
+            if (obj.isMesh && obj.morphTargetDictionary && obj.morphTargetInfluences) {
+              const idx = obj.morphTargetDictionary[key];
+              if (idx !== undefined) obj.morphTargetInfluences[idx] = val;
+            }
+          });
+        }
+        const brain = {
+          enabled: true,
+          intervalMs: 4000,
+          model: 'tinyllama' // Ollama model name
+        };
+                // Toggle & tune from GUI
+        const brainFolder = gui.addFolder('Brain');
+        brainFolder.add(brain, 'enabled').name('Enabled');
+        brainFolder.add(brain, 'intervalMs', 1500, 8000, 250).name('Decision ms');
+
+        // Kick off the loop
+        let brainTimer = setInterval(tickBrain, brain.intervalMs);
+        brainFolder.add({apply:()=>{ clearInterval(brainTimer); brainTimer = setInterval(tickBrain, brain.intervalMs); }}, 'apply').name('Apply interval');
+
+        async function tickBrain(){
+          if (!brain.enabled) return;
+
+          try {
+            const decision = await askBrainForDecision({
+              // keep context tiny; add your own sensors later
+              time: Date.now(),
+              currentState: Object.keys(actions).find(k => actions[k] === activeAction) || 'Idle'
+            });
+
+            if (decision) applyDecision(decision);
+          } catch (err) {
+            console.warn('Brain error:', err);
+          }
+        }
+
+        async function askBrainForDecision(ctx) {
+          // Robust structured output using JSON Schema
+          const schema = {
+            type: "object",
+            properties: {
+              state: { type: "string", enum: states },
+              emote: { type: "string", enum: emotes, nullable: true },
+              expressions: {
+                type: "object",
+                properties: {
+                  Angry: { type: "number", minimum: 0, maximum: 1 },
+                  Surprised: { type: "number", minimum: 0, maximum: 1 },
+                  Sad: { type: "number", minimum: 0, maximum: 1 }
+                },
+                additionalProperties: false
+              },
+              duration: { type: "number", minimum: 1, maximum: 6 }
+            },
+            required: ["state"],
+            additionalProperties: false
+          };
+
+          const system = `You control a 3D robot. Pick ONE looping base state, optionally trigger ONE emote, and set any of the 3 facial expressions (0..1). Output ONLY JSON per the schema. Keep it varied but reasonable indoors.`;
+          const prompt = [
+            `Valid states: ${states.join(', ')}`,
+            `Valid emotes: ${emotes.join(', ')}`,
+            `Expressions: Angry, Surprised, Sad are 0..1`,
+            `Context: ${JSON.stringify(ctx)}`
+          ].join('\n');
+
+          const res = await fetch('http://localhost:11434/api/generate', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+              model: brain.model,
+              system, prompt,
+              stream: false,
+              // Ask Ollama to conform to the schema
+              format: schema,
+              options: { temperature: 0.7, num_predict: 128 }
+            })
+          });
+
+          const body = await res.json();
+          try { return JSON.parse(body.response); } catch { return null; }
+        }
+
+        function applyDecision({ state, emote, expressions, duration = 3 }) {
+          // Switch looping state
+          if (state && actions[state]) crossfadeTo(state, 0.35);
+
+          // Optional one-shot
+          if (emote && actions[emote]) playOneShot(emote);
+
+          // Facial morphs
+          if (expressions) {
+            for (const [k, v] of Object.entries(expressions)) setExpression(k, clamp01(v));
+          }
+
+          // Optional: you can modulate speed or intensity here based on duration
+        }
+
+        function clamp01(v){ return Math.max(0, Math.min(1, v)); }
+        // === BRAIN (TinyLlama via Ollama) - END ===
+      });
+
+      // render loop
+      const clock = new THREE.Clock();
+      function onResize(){ camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); }
+      addEventListener('resize', onResize);
+
+      (function animate(){
+        requestAnimationFrame(animate);
+        mixer?.update(clock.getDelta());
+        renderer.render(scene, camera);
+      })();
+    </script>
+  </body>
+</html>
